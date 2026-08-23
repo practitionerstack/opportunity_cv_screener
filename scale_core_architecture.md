@@ -1,22 +1,7 @@
 # Enterprise Scale Core
 
-Production path:
+Client Portal/API -> Object Storage -> Batch Manifest -> Queue -> Parallel Workers -> Results Database -> Ranking/Reporting
 
-Object Storage
-→ Batch Manifest
-→ Queue
-→ Parallel Workers
-→ Results Database
-→ Ranking and Reporting
+Required: per-file IDs, idempotency, resumable checkpoints, retry queue, dead-letter queue, audit trail, batch progress, horizontal worker scaling.
 
-## Required scale capabilities
-- Resumable batches
-- Per-file status
-- Idempotent processing
-- Checkpoints
-- Retry queue
-- Dead-letter handling
-- Audit events
-- Horizontal worker scaling
-
-The Streamlit application is the control panel and small-batch interface. Large jobs should process through external storage and workers without rewriting the screening engine.
+Do not process million-CV jobs inside a single Streamlit session.

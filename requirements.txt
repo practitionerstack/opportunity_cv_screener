@@ -1,8 +1,9 @@
-streamlit
-pandas
-openpyxl
-pypdf
-python-docx
-reportlab
-matplotlib
-requests
+streamlit>=1.37
+pandas>=2.2
+requests>=2.31
+pypdf>=5.0
+python-docx>=1.1
+openpyxl>=3.1
+matplotlib>=3.8
+reportlab>=4.2
+xlrd>=2.0

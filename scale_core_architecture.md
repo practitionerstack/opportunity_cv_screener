@@ -1,7 +1,4 @@
-# Enterprise Scale Core
+# Scale Architecture
+Browser/API -> resumable uploads -> object storage -> queue -> extraction workers -> duplicate fingerprint index -> evidence scoring -> database/search -> reporting.
 
-Client Portal/API -> Object Storage -> Batch Manifest -> Queue -> Parallel Workers -> Results Database -> Ranking/Reporting
-
-Required: per-file IDs, idempotency, resumable checkpoints, retry queue, dead-letter queue, audit trail, batch progress, horizontal worker scaling.
-
-Do not process million-CV jobs inside a single Streamlit session.
+Controls: idempotent job IDs, per-file status, retries, dead-letter queue, audit evidence, duplicate hashes/content fingerprints, human review for borderline cases.

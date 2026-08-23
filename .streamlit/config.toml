@@ -1,7 +1,2 @@
 [server]
 maxUploadSize = 500
-maxMessageSize = 500
-fileWatcherType = "none"
-
-[browser]
-gatherUsageStats = false

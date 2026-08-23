@@ -1,1 +1,9 @@
+[server]
+# Allow larger operational batches on Streamlit Community Cloud.
+maxUploadSize = 500
+maxMessageSize = 500
+# Workaround for Community Cloud/file_uploader XSRF upload failures.
+enableXsrfProtection = false
 
+[browser]
+gatherUsageStats = false

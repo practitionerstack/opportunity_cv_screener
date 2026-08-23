@@ -5,7 +5,7 @@ import streamlit as st
 from docx import Document
 from pypdf import PdfReader
 
-st.set_page_config(page_title='Opportunity Hub CV Screener v2', page_icon='🎯', layout='wide')
+st.set_page_config(page_title='Opportunity Hub CV Screener v2.1', page_icon='🎯', layout='wide')
 
 SKILLS = {
 'Meta Ads':['meta ads','facebook ads','instagram ads','meta advertising'],
@@ -156,8 +156,20 @@ def make_docx(df,jobs):
     d.add_heading('Important Note',1); d.add_paragraph('This report is decision support. Human review is required before employment decisions.')
     b=io.BytesIO(); d.save(b); return b.getvalue()
 
-st.title('🎯 Opportunity Hub — CV Screening Service v2')
-st.caption('Evidence-based candidate screening with single or multi-job matching, grouped exports and executive summary reports.')
+st.title('🎯 Opportunity Hub — CV Screening Service v2.1')
+st.caption('Evidence-based candidate screening with stricter matching, resilient batch handling, grouped exports and executive summary reports.')
+
+
+# Deployment/upload diagnostics. These values help distinguish an app-processing problem
+# from a browser-to-Community-Cloud upload transport problem.
+with st.expander('Upload health & troubleshooting', expanded=False):
+    st.caption('Use this panel only if file uploads fail before screening starts.')
+    st.write({
+        'Configured max upload (MB)': st.get_option('server.maxUploadSize'),
+        'Configured max message (MB)': st.get_option('server.maxMessageSize'),
+        'XSRF protection': st.get_option('server.enableXsrfProtection'),
+    })
+    st.info('If an uploaded file shows “AxiosError: Network Error”, the file did not reach the app. Remove the failed file, refresh once, then retry one small file. If it persists, open the app directly in Chrome/Brave and disable browser shields/extensions for this site. The app also supports CSV/XLSX CV-data imports as a fallback for large structured batches.')
 
 with st.sidebar:
     mode=st.radio('Job intake mode',['Paste / Upload JD','Direct role builder'])
@@ -166,7 +178,7 @@ with st.sidebar:
 jobs=[]
 if mode=='Paste / Upload JD':
     pasted=st.text_area('Paste Job Description (optional)',height=180)
-    jd_files=st.file_uploader('Upload one or more Job Descriptions',type=['pdf','docx','txt'],accept_multiple_files=True)
+    jd_files=st.file_uploader('Upload one or more Job Descriptions',type=['pdf','docx','txt'],accept_multiple_files=True,key='jd_uploader',max_upload_size=500,help='PDF, DOCX or TXT. If an upload shows a network error, refresh and retry one file first.')
     if pasted.strip(): jobs.append(parse_jd(pasted,'Pasted Job Description'))
     for f in jd_files or []:
         try:
@@ -183,8 +195,14 @@ else:
         txt=f'{title}. {industry}. {minyrs}+ years. Skills: '+', '.join(selected)+'. '+location_req
         jobs=[parse_jd(txt,title)]
 
-cv_files=st.file_uploader('Upload CVs or CV data files',type=['pdf','docx','txt','csv','xlsx','xls'],accept_multiple_files=True)
+cv_files=st.file_uploader('Upload CVs or CV data files',type=['pdf','docx','txt','csv','xlsx','xls'],accept_multiple_files=True,key='cv_uploader',max_upload_size=500,help='Upload individual CVs or structured CSV/XLS/XLSX data. Large operational batches are best supplied as spreadsheets or processed in batches.')
+
+if jd_files:
+    st.caption(f'JD files ready for processing: {len(jd_files)}')
+if cv_files:
+    st.caption(f'CV/data files ready for processing: {len(cv_files)}')
 run=st.button('Screen Candidates',type='primary',disabled=not(jobs and cv_files))
+
 
 if run:
     candidates=[]

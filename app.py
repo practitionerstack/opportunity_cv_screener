@@ -1,239 +1,266 @@
-import io, re, zipfile
+import io, re, json, zipfile
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+
 import pandas as pd
+import requests
 import streamlit as st
-from docx import Document
 from pypdf import PdfReader
+from docx import Document
 
-st.set_page_config(page_title='Opportunity Hub CV Screener v2.1', page_icon='🎯', layout='wide')
+st.set_page_config(page_title="Opportunity Hub CV Screener v2.2", page_icon="🎯", layout="wide")
 
-SKILLS = {
-'Meta Ads':['meta ads','facebook ads','instagram ads','meta advertising'],
-'Google Ads':['google ads','google adwords','adwords'],
-'GA4':['ga4','google analytics 4','google analytics'],
-'Email Marketing':['email marketing','email campaigns','email campaign','newsletter','newsletters','mailchimp'],
-'Canva':['canva'],
-'Copywriting':['copywriting','copywriter','ad copy','social copy','marketing copy'],
-'HubSpot':['hubspot'],
-'A/B Testing':['a/b testing','ab testing','split testing'],
-'Google Tag Manager':['google tag manager','gtm'],
+# ---------- text / file ingestion ----------
+def normalize(s):
+    return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+def extract_pdf(data):
+    reader = PdfReader(io.BytesIO(data))
+    return "\n".join((p.extract_text() or "") for p in reader.pages)
+
+def extract_docx(data):
+    d = Document(io.BytesIO(data))
+    return "\n".join(p.text for p in d.paragraphs)
+
+def extract_txt(data):
+    return data.decode("utf-8", errors="ignore")
+
+def extract_file_bytes(name, data):
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext == "pdf": return extract_pdf(data)
+    if ext == "docx": return extract_docx(data)
+    if ext in ("txt", "md"): return extract_txt(data)
+    raise ValueError(f"Unsupported document type: .{ext}")
+
+def google_drive_direct(url):
+    m = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    if m: return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    qs = parse_qs(urlparse(url).query)
+    if qs.get("id"): return f"https://drive.google.com/uc?export=download&id={qs['id'][0]}"
+    return url
+
+def filename_from_response(url, response):
+    cd = response.headers.get("content-disposition", "")
+    m = re.search(r'filename="?([^";]+)', cd, re.I)
+    if m: return m.group(1)
+    path = urlparse(url).path
+    base = path.rsplit("/", 1)[-1] or "document.pdf"
+    return base
+
+def download_url(url):
+    target = google_drive_direct(url.strip())
+    r = requests.get(target, timeout=60, allow_redirects=True)
+    r.raise_for_status()
+    name = filename_from_response(target, r)
+    ctype = r.headers.get("content-type", "").lower()
+    # Google sometimes returns HTML login/permission page
+    if "text/html" in ctype and len(r.content) < 2_000_000:
+        raise ValueError("The link did not return the file. Make the file accessible to anyone with the link, then try again.")
+    return name, r.content
+
+# ---------- scoring ----------
+SKILL_ALIASES = {
+    "Meta Ads": [r"\bmeta ads?\b", r"\bfacebook ads?\b"],
+    "Google Ads": [r"\bgoogle ads?\b", r"\badwords\b"],
+    "GA4": [r"\bga4\b", r"\bgoogle analytics\b"],
+    "Email Marketing": [r"\bemail marketing\b", r"\bemail campaigns?\b", r"\bnewsletters?\b"],
+    "Canva": [r"\bcanva\b"],
+    "Copywriting": [r"\bcopywriting\b", r"\bad copy\b", r"\bmarketing copy\b", r"\bsocial copy\b"],
+    "HubSpot": [r"\bhubspot\b"],
+    "Google Tag Manager": [r"\bgoogle tag manager\b", r"\bgtm\b"],
+    "A/B Testing": [r"\ba/b testing\b", r"\bab testing\b", r"\bsplit testing\b"],
 }
-FINTECH = ['kuda','opay','o-pay','carbon','flutterwave','paystack','moniepoint','paga','gtbank','guaranty trust bank','access bank','zenith bank','first bank','uba','stanbic ibtc','wema bank','palmpay']
+FINTECH = ["kuda", "opay", "carbon", "flutterwave", "paystack", "moniepoint", "paga", "gtbank", "access bank", "zenith bank", "firstbank", "sterling bank", "wema bank", "banking", "fintech"]
 
+NEG_PATTERNS = [r"no\s+{term}", r"without\s+{term}", r"lack(?:s|ing)?\s+{term}", r"not\s+.*{term}"]
+PARTIAL_WORDS = ["basic", "assisted", "support", "boosted posts", "exposure"]
 
-def norm(x): return re.sub(r'\s+',' ',str(x).lower()).strip()
+def has_explicit_negative(text, label):
+    term = re.escape(label.lower())
+    return any(re.search(p.format(term=term), text) for p in NEG_PATTERNS)
 
-def read_text_file(f):
-    name=f.name.lower(); data=f.getvalue()
-    if name.endswith('.pdf'):
-        return '\n'.join((p.extract_text() or '') for p in PdfReader(io.BytesIO(data)).pages)
-    if name.endswith('.docx'):
-        d=Document(io.BytesIO(data)); return '\n'.join(p.text for p in d.paragraphs)
-    if name.endswith('.txt'): return data.decode('utf-8',errors='ignore')
-    return ''
+def skill_evidence(text, skill):
+    t = normalize(text)
+    if has_explicit_negative(t, skill): return 0.0, "explicitly missing"
+    found = any(re.search(p, t, re.I) for p in SKILL_ALIASES.get(skill, [re.escape(skill.lower())]))
+    if not found: return 0.0, "not evidenced"
+    if any(w in t for w in PARTIAL_WORDS):
+        # only reduce if qualifier appears near the skill where practical
+        for pat in SKILL_ALIASES.get(skill, []):
+            m = re.search(r"(.{0,60})" + pat, t, re.I)
+            if m and any(w in m.group(1) for w in PARTIAL_WORDS):
+                return 0.5, "basic/limited evidence"
+    return 1.0, "confirmed"
 
-def read_structured_cvs(f):
-    data=f.getvalue(); name=f.name.lower()
-    if name.endswith('.csv'): df=pd.read_csv(io.BytesIO(data))
-    else: df=pd.read_excel(io.BytesIO(data))
-    cols={c.lower():c for c in df.columns}
-    textcol=next((cols[x] for x in cols if x in ['cv','cv text','resume','resume text','text','content']),None)
-    namecol=next((cols[x] for x in cols if x in ['name','candidate','candidate name','full name']),None)
-    if not textcol: raise ValueError('Spreadsheet needs a CV/Resume/Text column containing candidate CV text.')
-    out=[]
-    for i,r in df.fillna('').iterrows():
-        txt=str(r[textcol]); nm=str(r[namecol]) if namecol else f'{f.name} row {i+1}'
-        if len(txt.strip())>=20: out.append((nm,txt,f'{f.name} row {i+1}'))
-    return out
+def extract_years(text):
+    years = re.findall(r"\b(20\d{2})\s*[-–—to]+\s*(20\d{2}|present|current)\b", text, re.I)
+    vals=[]
+    now=datetime.now().year
+    for a,b in years:
+        end = now if b.lower() in ("present","current") else int(b)
+        vals.append(max(0,end-int(a)))
+    return max(vals) if vals else 0
 
-def extract_name(text, fallback):
-    for line in [x.strip() for x in text.splitlines() if x.strip()][:12]:
-        if re.fullmatch(r'[A-Za-z .\-]{5,60}',line) and not any(k in line.lower() for k in ['curriculum','resume','cv','experience','marketing','executive','specialist','lead','skills','education','profile']): return line.title()
-    return re.sub(r'[_\-]+',' ',fallback.rsplit('.',1)[0]).title()
+def infer_name(text, fallback):
+    lines=[x.strip() for x in text.splitlines() if x.strip()]
+    for line in lines[:8]:
+        if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{2,60}", line) and not any(k in line.lower() for k in ["curriculum","resume","cv","experience","email","phone"]):
+            return line.title()
+    return fallback.rsplit('.',1)[0].replace('_',' ').replace('-',' ').title()
 
-def years_exp(text):
-    spans=[]; now=datetime.now().year
-    for a,b in re.findall(r'\b(20\d{2})\s*[-–]\s*(20\d{2}|present|current)\b',text,re.I):
-        a=int(a); b=now if b.lower() in ['present','current'] else int(b)
-        if b>=a: spans.append((a,b))
-    if not spans:return 0
-    yrs=set()
-    for a,b in spans: yrs.update(range(a,b+1))
-    return max(0,len(yrs)-1)
+def parse_jd(jd):
+    t=normalize(jd)
+    role = "Screened Role"
+    m=re.search(r"(?:role|position|job title)\s*[:#-]?\s*([^\n]{3,100})", jd, re.I)
+    if m: role=m.group(1).strip()
+    required=[]
+    for s in SKILL_ALIASES:
+        if any(re.search(p,t,re.I) for p in SKILL_ALIASES[s]): required.append(s)
+    min_years=0
+    ym=re.search(r"(\d+)\+?\s+years?", t)
+    if ym: min_years=int(ym.group(1))
+    location=""
+    for city in ["lagos","abuja","port harcourt","ibadan","enugu","remote"]:
+        if city in t: location=city.title(); break
+    fintech = any(x in t for x in ["fintech","banking","financial services"])
+    return {"role":role,"required":required,"min_years":min_years,"location":location,"fintech":fintech}
 
-def explicit_negative(t, alias):
-    a=re.escape(alias)
-    pats=[rf'\bno\s+{a}\b',rf'\bno\s+experience\s+(?:in|with)\s+{a}\b',rf'\b{a}\s*:\s*no\b']
-    return any(re.search(p,t,re.I) for p in pats)
-
-def evidence(text, skill):
-    t=norm(text); aliases=SKILLS.get(skill,[skill.lower()])
-    for a in aliases:
-        if explicit_negative(t,a): return 'missing'
-    hits=[]
-    for a in aliases:
-        hits += [m.start() for m in re.finditer(re.escape(a),t,re.I)]
-    if not hits:return 'unknown'
-    for p in hits:
-        w=t[max(0,p-100):p+180]
-        if any(x in w for x in ['boosted post','basic ','assisted','support','exposure to','intern','helped with']): return 'partial'
-    return 'confirmed'
-
-def fintech_evidence(text):
-    t=norm(text)
-    return next((x for x in FINTECH if re.search(r'(?<![a-z])'+re.escape(x)+r'(?![a-z])',t)),None)
-
-def location(text):
-    t=norm(text)
-    if 'lagos' in t:return 'Lagos / Strong'
-    if 'remote' in t:return 'Remote / Review'
-    for c in ['abuja','ibadan','port harcourt','enugu','kano','benin','kaduna']:
-        if c in t:return f'{c.title()} / Review'
-    return 'Unknown / Review'
-
-def parse_jd(text,title):
-    j=norm(text); req=[]
-    for s,aliases in SKILLS.items():
-        if any(a in j for a in aliases):
-            # preferred/nice gets lower weight
-            pos=min([j.find(a) for a in aliases if a in j])
-            ctx=j[max(0,pos-80):pos+100]
-            req.append((s,5 if any(x in ctx for x in ['nice to have','nice-to-have','preferred','plus']) else 12))
-    if not req and any(x in j for x in ['digital marketing','performance marketing','marketing executive']):
-        req=[('Meta Ads',12),('Google Ads',12),('GA4',10),('Email Marketing',10),('Canva',5),('Copywriting',8)]
-    return {'title':title,'text':text,'requirements':req,'min_years': int(re.search(r'(\d+)\s*\+?\s*years',j).group(1)) if re.search(r'(\d+)\s*\+?\s*years',j) else 0,'industry':('fintech/banking' if any(x in j for x in ['fintech','banking']) else ''),'lagos_hybrid':('hybrid' in j and 'lagos' in j)}
-
-def score(text,jd):
-    deductions=[]; gaps=[]; matched=[]; audit=[]; score=100
-    for skill,w in jd['requirements']:
-        ev=evidence(text,skill)
-        if ev=='confirmed': matched.append(skill); audit.append(f'{skill}: full evidence')
-        elif ev=='partial':
-            d=max(1,w//2); score-=d; deductions.append(f'Limited {skill}: -{d}pts'); gaps.append(f'Limited {skill}'); matched.append(f'{skill} (basic)'); audit.append(f'{skill}: partial evidence')
+def score_candidate(name, cv_text, jd):
+    spec=parse_jd(jd)
+    t=normalize(cv_text)
+    years=extract_years(cv_text)
+    audit=[]; deductions=[]; score=100.0
+    # Skills: only requirements explicitly found in JD
+    for skill in spec["required"]:
+        ev, reason=skill_evidence(cv_text, skill)
+        if ev==1: audit.append(f"{skill}: confirmed")
+        elif ev==0.5:
+            score-=6; deductions.append(f"Limited {skill}: -6pts"); audit.append(f"{skill}: limited")
         else:
-            score-=w; deductions.append(f'No confirmed {skill}: -{w}pts'); gaps.append(f'No confirmed {skill}'); audit.append(f'{skill}: no evidence')
-    yrs=years_exp(text)
-    if jd['min_years'] and yrs<jd['min_years']:
-        d=15; score-=d; deductions.append(f'Below {jd["min_years"]}+ years: -{d}pts'); gaps.append('Below minimum experience')
-    elif yrs: audit.append(f'Experience: {yrs} years')
-    ft=fintech_evidence(text)
-    if jd['industry']:
-        if ft: audit.append(f'Industry: confirmed ({ft})')
-        else: score-=8; deductions.append('No confirmed fintech/banking background: -8pts'); gaps.append('No confirmed industry background')
-    loc=location(text)
-    if jd['lagos_hybrid'] and not loc.startswith('Lagos'):
-        score-=5; deductions.append('Not Lagos-based for hybrid role: -5pts'); gaps.append('Location mismatch')
-    score=max(0,score)
-    if score>=90: group='Excellent'; verdict='Excellent match; shortlist immediately.'
-    elif score>=70: group='Good'; verdict='Strong candidate; shortlist with minor gaps.'
-    elif score>=50: group='Moderate'; verdict='Possible fit; gaps require careful review.'
-    elif score>=30: group='Maybe'; verdict='Weak fit; interview only with strong compensating evidence.'
-    else: group='Do Not Hire'; verdict='Poor match; do not prioritize for shortlist.'
+            score-=12; deductions.append(f"No {skill} evidence: -12pts"); audit.append(f"{skill}: missing")
+    if spec["min_years"] and years < spec["min_years"]:
+        score-=15; deductions.append(f"Less than {spec['min_years']} years: -15pts")
+        audit.append(f"Experience: {years} years estimated")
+    else: audit.append(f"Experience: {years} years estimated")
+    if spec["fintech"]:
+        if any(x in t for x in FINTECH): audit.append("Industry: fintech/banking evidenced")
+        else: score-=10; deductions.append("No fintech/banking evidence: -10pts"); audit.append("Industry: not evidenced")
+    # location from common city mentions, only if JD specifies a city and not remote
+    loc="Remote" if "remote" in t else ""
+    for city in ["lagos","abuja","port harcourt","ibadan","enugu"]:
+        if city in t: loc=city.title(); break
+    if spec["location"] and spec["location"].lower() not in ("remote",) and loc and loc.lower()!=spec["location"].lower():
+        score-=5; deductions.append(f"Not {spec['location']}-based: -5pts")
+    elif spec["location"] and not loc:
+        audit.append("Location: not confidently extracted")
+    score=max(0, round(score))
+    if score>=90: group="Excellent"; verdict="Excellent match; shortlist immediately."
+    elif score>=70: group="Good"; verdict="Strong candidate; shortlist with review."
+    elif score>=50: group="Moderate"; verdict="Possible fit; gaps need careful review."
+    elif score>=30: group="Maybe"; verdict="Weak fit; consider only if market is thin."
+    else: group="Do Not Hire"; verdict="Poor match; do not prioritize."
+    matched=[]
+    for s in spec["required"]:
+        ev,_=skill_evidence(cv_text,s)
+        if ev>0: matched.append(s)
     green=[]
-    if ft: green.append(f'Confirmed fintech/banking background ({ft})')
-    if yrs: green.append(f'{yrs}+ years experience')
-    green += [x for x in matched if '(basic)' not in x]
-    return score,group,verdict,'; '.join(deductions[:6]) or 'Meets stated requirements','; '.join(gaps[:2]) or 'None material','; '.join(green[:3]) or 'Relevant transferable evidence',yrs,', '.join(matched) or 'None confirmed',loc,'; '.join(audit)
+    if any(x in t for x in FINTECH): green.append("Direct fintech/banking experience")
+    if years>=spec["min_years"]>0: green.append(f"{years}+ years experience")
+    if matched: green.append("Matched: " + ", ".join(matched[:3]))
+    red="; ".join(deductions[:2]) if deductions else "None material"
+    why="; ".join(deductions[:3]) if deductions else "Meets evidenced requirements"
+    return {
+        "Name":name,"Fit %":score,"Group":group,"2-Line Verdict":verdict,
+        "Why Not 100%":why,"Red Flag":red,"Green Flag":"; ".join(green) or "Evidence requires review",
+        "Years Exp":years,"Skills Match":", ".join(matched) or "None evidenced",
+        "Visa/Location":loc or "Review","Audit Trail":" | ".join(audit)
+    }
 
-def make_excel(df):
+def excel_bytes(df):
     out=io.BytesIO()
-    with pd.ExcelWriter(out,engine='openpyxl') as w:
-        df.to_excel(w,index=False,sheet_name='Summary')
-        for g in ['Excellent','Good','Moderate','Maybe','Do Not Hire','Review Required']:
-            x=df[df['Ranking Group']==g]
-            x.to_excel(w,index=False,sheet_name=g[:31])
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w,index=False,sheet_name="Summary")
+        for group in ["Excellent","Good","Moderate","Maybe","Do Not Hire"]:
+            sub=df[df["Group"]==group]
+            sub.to_excel(w,index=False,sheet_name=group[:31])
     return out.getvalue()
 
-def make_docx(df,jobs):
-    d=Document(); d.add_heading('Opportunity Hub Candidate Screening Summary',0)
-    d.add_paragraph(f'Screening date: {datetime.now().strftime("%d %B %Y")}')
-    d.add_paragraph(f'Job descriptions processed: {len(jobs)}')
-    d.add_paragraph(f'Candidate records screened: {len(df)}')
-    d.add_heading('Executive Summary',1)
-    for g,n in df['Ranking Group'].value_counts().reindex(['Excellent','Good','Moderate','Maybe','Do Not Hire'],fill_value=0).items(): d.add_paragraph(f'{g}: {n}')
-    d.add_heading('Top Recommendations',1)
-    for _,r in df.sort_values('Fit %',ascending=False).head(10).iterrows(): d.add_paragraph(f"{r['Name']} — {r['Fit %']}% — {r['Best Job Match']}")
-    d.add_heading('Important Note',1); d.add_paragraph('This report is decision support. Human review is required before employment decisions.')
+def read_docx_bytes(title, df):
+    d=Document(); d.add_heading("Opportunity Hub Candidate Screening Summary",0)
+    d.add_paragraph(f"Role: {title}")
+    d.add_paragraph(f"Candidates screened: {len(df)}")
+    d.add_paragraph(f"Generated: {datetime.now().strftime('%d %B %Y %H:%M')}")
+    d.add_heading("Executive Summary", level=1)
+    for g in ["Excellent","Good","Moderate","Maybe","Do Not Hire"]:
+        d.add_paragraph(f"{g}: {int((df['Group']==g).sum())}")
+    d.add_heading("Top Candidates", level=1)
+    for _,r in df.head(10).iterrows(): d.add_paragraph(f"{r['Name']} — {r['Fit %']}% — {r['2-Line Verdict']}")
     b=io.BytesIO(); d.save(b); return b.getvalue()
 
-st.title('🎯 Opportunity Hub — CV Screening Service v2.1')
-st.caption('Evidence-based candidate screening with stricter matching, resilient batch handling, grouped exports and executive summary reports.')
+# ---------- UI ----------
+st.title("🎯 Opportunity Hub — CV Screening Service v2.2")
+st.caption("Evidence-based candidate screening with a mobile-friendly URL import fallback.")
 
+if "candidates" not in st.session_state: st.session_state.candidates=[]
 
-# Deployment/upload diagnostics. These values help distinguish an app-processing problem
-# from a browser-to-Community-Cloud upload transport problem.
-with st.expander('Upload health & troubleshooting', expanded=False):
-    st.caption('Use this panel only if file uploads fail before screening starts.')
-    st.write({
-        'Configured max upload (MB)': st.get_option('server.maxUploadSize'),
-        'Configured max message (MB)': st.get_option('server.maxMessageSize'),
-        'XSRF protection': st.get_option('server.enableXsrfProtection'),
-    })
-    st.info('If an uploaded file shows “AxiosError: Network Error”, the file did not reach the app. Remove the failed file, refresh once, then retry one small file. If it persists, open the app directly in Chrome/Brave and disable browser shields/extensions for this site. The app also supports CSV/XLSX CV-data imports as a fallback for large structured batches.')
+with st.expander("How to use this version", expanded=True):
+    st.write("If mobile file upload fails, use the **Public File Links** tab. For Google Drive, set each file to **Anyone with the link** and paste the links. The server downloads the files directly, bypassing the phone-to-Streamlit uploader.")
 
-with st.sidebar:
-    mode=st.radio('Job intake mode',['Paste / Upload JD','Direct role builder'])
-    st.info('For very large volumes, use structured CSV/XLSX exports or batch files. Million-scale processing requires the future background-worker infrastructure.')
+jd_text = st.text_area("Paste Job Description", height=180, placeholder="Paste the full JD here...")
+input_mode=st.radio("Document intake", ["Public File Links (recommended if uploads fail)", "Phone Upload", "Paste CV Text"], horizontal=False)
 
-jobs=[]
-if mode=='Paste / Upload JD':
-    pasted=st.text_area('Paste Job Description (optional)',height=180)
-    jd_files=st.file_uploader('Upload one or more Job Descriptions',type=['pdf','docx','txt'],accept_multiple_files=True,key='jd_uploader',max_upload_size=500,help='PDF, DOCX or TXT. If an upload shows a network error, refresh and retry one file first.')
-    if pasted.strip(): jobs.append(parse_jd(pasted,'Pasted Job Description'))
-    for f in jd_files or []:
+jd_loaded=""
+candidates=[]
+
+if input_mode=="Public File Links (recommended if uploads fail)":
+    jd_url=st.text_input("Public JD file link (PDF/DOCX/TXT)")
+    cv_urls=st.text_area("Public CV file links — one link per line", height=180, placeholder="https://drive.google.com/file/d/.../view\nhttps://...")
+    if jd_url:
         try:
-            txt=read_text_file(f)
-            if len(txt.strip())>=20: jobs.append(parse_jd(txt,f.name))
-        except Exception as e: st.error(f'Could not read {f.name}: {e}')
+            n,b=download_url(jd_url); jd_loaded=extract_file_bytes(n,b); st.success(f"JD link fetched: {n}")
+        except Exception as e: st.error(f"JD link failed: {e}")
+    for url in [x.strip() for x in cv_urls.splitlines() if x.strip()]:
+        try:
+            n,b=download_url(url); txt=extract_file_bytes(n,b); candidates.append((n,txt)); st.success(f"CV fetched: {n}")
+        except Exception as e: st.error(f"CV link failed: {url[:50]}… — {e}")
+elif input_mode=="Phone Upload":
+    st.warning("For Android reliability, add one CV at a time. If this uploader shows AxiosError again, switch to Public File Links above.")
+    jd_file=st.file_uploader("Upload one JD", type=["pdf","docx","txt"], key="jd_single")
+    if jd_file:
+        try: jd_loaded=extract_file_bytes(jd_file.name,jd_file.getvalue()); st.success("JD ready")
+        except Exception as e: st.error(f"JD read failed: {e}")
+    cv_file=st.file_uploader("Upload one CV", type=["pdf","docx","txt"], key="cv_single")
+    if cv_file:
+        try:
+            txt=extract_file_bytes(cv_file.name,cv_file.getvalue())
+            candidates.append((cv_file.name,txt)); st.success("CV ready for this run")
+        except Exception as e: st.error(f"CV read failed: {e}")
 else:
-    title=st.text_input('Job role title',placeholder='e.g. Digital Marketing Executive')
-    industry=st.text_input('Industry (optional)',placeholder='e.g. Fintech')
-    minyrs=st.number_input('Minimum years experience',0,30,2)
-    selected=st.multiselect('Required / preferred skills',list(SKILLS.keys()))
-    location_req=st.selectbox('Work/location requirement',['Any location','Lagos hybrid','Remote','Lagos'])
-    if title.strip():
-        txt=f'{title}. {industry}. {minyrs}+ years. Skills: '+', '.join(selected)+'. '+location_req
-        jobs=[parse_jd(txt,title)]
+    pasted_name=st.text_input("Candidate name")
+    pasted_cv=st.text_area("Paste CV text", height=250)
+    if pasted_cv.strip(): candidates.append((pasted_name or "Candidate",pasted_cv))
 
-cv_files=st.file_uploader('Upload CVs or CV data files',type=['pdf','docx','txt','csv','xlsx','xls'],accept_multiple_files=True,key='cv_uploader',max_upload_size=500,help='Upload individual CVs or structured CSV/XLS/XLSX data. Large operational batches are best supplied as spreadsheets or processed in batches.')
+if st.button("Screen Candidates", type="primary"):
+    jd_final=jd_text.strip() or jd_loaded.strip()
+    if not jd_final: st.error("Provide a Job Description by pasting it, uploading it, or adding a public link.")
+    elif not candidates: st.error("Provide at least one CV by link, upload, or pasted text.")
+    else:
+        rows=[]
+        prog=st.progress(0)
+        for i,(fname,txt) in enumerate(candidates,1):
+            name=infer_name(txt,fname)
+            row=score_candidate(name,txt,jd_final); row["Resume Link"]=fname
+            rows.append(row); prog.progress(i/len(candidates))
+        df=pd.DataFrame(rows).sort_values(["Fit %","Name"],ascending=[False,True]).reset_index(drop=True)
+        st.session_state.results=df; st.session_state.jd=jd_final
 
-if jd_files:
-    st.caption(f'JD files ready for processing: {len(jd_files)}')
-if cv_files:
-    st.caption(f'CV/data files ready for processing: {len(cv_files)}')
-run=st.button('Screen Candidates',type='primary',disabled=not(jobs and cv_files))
-
-
-if run:
-    candidates=[]
-    for f in cv_files:
-        try:
-            if f.name.lower().endswith(('.csv','.xlsx','.xls')): candidates.extend(read_structured_cvs(f))
-            else:
-                txt=read_text_file(f)
-                if len(txt.strip())<20: raise ValueError('Could not extract enough text')
-                candidates.append((extract_name(txt,f.name),txt,f.name))
-        except Exception as e:
-            candidates.append((f.name,'',f.name+f' [EXTRACTION FAILED: {str(e)[:100]}]'))
-    rows=[]; bar=st.progress(0); status=st.empty()
-    total=len(candidates)
-    for i,(name,text,source) in enumerate(candidates):
-        if not text:
-            rows.append({'Name':name,'Fit %':0,'2-Line Verdict':'Could not reliably process this CV.','Why Not 100%':'Extraction failed','Red Flag':'Extraction failed','Green Flag':'Manual review required','Years Exp':0,'Skills Match':'','Visa/Location':'Unknown','Best Job Match':'','Ranking Group':'Review Required','Resume Link':source,'Audit Trail':'Extraction failed'})
-        else:
-            options=[]
-            for j in jobs:
-                s=score(text,j); options.append((s[0],j['title'],s))
-            best=max(options,key=lambda x:x[0]); s=best[2]
-            rows.append({'Name':name,'Fit %':s[0],'2-Line Verdict':s[2],'Why Not 100%':s[3],'Red Flag':s[4],'Green Flag':s[5],'Years Exp':s[6],'Skills Match':s[7],'Visa/Location':s[8],'Best Job Match':best[1],'Ranking Group':s[1],'Resume Link':source,'Audit Trail':s[9]})
-        bar.progress((i+1)/max(1,total)); status.caption(f'Processed {i+1:,} of {total:,} candidate records')
-    st.session_state.results=pd.DataFrame(rows).sort_values(['Fit %','Name'],ascending=[False,True]).reset_index(drop=True)
-    st.session_state.jobs=jobs
-
-if 'results' in st.session_state:
-    df=st.session_state.results; jobs=st.session_state.jobs
-    st.subheader(f'Ranked Results — {len(df):,} Candidates')
-    st.dataframe(df[['Name','Fit %','2-Line Verdict','Why Not 100%','Red Flag','Green Flag','Years Exp','Skills Match','Visa/Location','Resume Link']],use_container_width=True,hide_index=True)
-    st.download_button('⬇ Download grouped Excel workbook',make_excel(df),'opportunity_hub_screening.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    st.download_button('⬇ Download CSV',df.to_csv(index=False).encode(),'opportunity_hub_screening.csv','text/csv')
-    st.download_button('⬇ Download executive summary DOCX',make_docx(df,jobs),'opportunity_hub_screening_summary.docx','application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+if "results" in st.session_state:
+    df=st.session_state.results
+    st.subheader("Screening Results")
+    st.dataframe(df.drop(columns=["Group","Audit Trail"], errors="ignore"), use_container_width=True)
+    st.download_button("Download Excel workbook", excel_bytes(df), "candidate_screening_results.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("Download CSV", df.to_csv(index=False).encode(), "candidate_screening_results.csv", "text/csv")
+    role=parse_jd(st.session_state.jd)["role"]
+    st.download_button("Download executive summary DOCX", read_docx_bytes(role,df), "candidate_screening_summary.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    with st.expander("Show score audit trail"):
+        st.dataframe(df[["Name","Fit %","Audit Trail"]], use_container_width=True)

@@ -12,7 +12,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Opportunity Hub CV Screener v2.7", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Opportunity Hub CV Screener v2.7.1", page_icon="🎯", layout="wide")
 
 # ------------------------------ FILE INTAKE ------------------------------
 def sha256(data): return hashlib.sha256(data).hexdigest()
@@ -83,25 +83,41 @@ PREF_HEADINGS=("nice to have","preferred","desirable","bonus","plus","advantage"
 
 def clean_line(s): return re.sub(r"\s+"," ",(s or "")).strip()
 
+def normalize_jd_sections(jd):
+    """Normalize flattened PDF/DOCX text so inline markdown headings become real section boundaries."""
+    text=(jd or "").replace("\r", "\n")
+    # Remove common markdown emphasis around headings without destroying body text.
+    text=re.sub(r"\*{1,3}\s*(Must\s*Have|Requirements?|Required|Essential|Minimum\s+Qualifications|Qualifications|What\s+You\s+Need|Skills\s+Required|Nice\s*to\s*Have|Preferred|Desirable|Bonus|Plus|Advantage)\s*\*{1,3}\s*:?", lambda m: "\n"+m.group(1).strip()+":", text, flags=re.I)
+    # Insert a boundary before recognised headings even when the extractor flattened everything onto one line.
+    heads=["Must Have","Requirements","Required","Essential","Minimum Qualifications","Qualifications","What You Need","Skills Required","Nice to Have","Preferred","Desirable","Bonus","Plus","Advantage"]
+    pat=r"(?i)(?<!\n)(?<!^)(?=\b(?:"+"|".join(re.escape(h) for h in heads)+r")\b\s*:)"
+    text=re.sub(pat,"\n",text)
+    return text
+
 def heading_kind(line):
-    x=clean_line(line).lower().rstrip(":-")
-    if any(h in x for h in PREF_HEADINGS): return "preferred"
-    if any(h in x for h in MUST_HEADINGS): return "required"
+    x=clean_line(line).lower().strip(" *#_-\t").rstrip(":-")
+    # Heading must begin with a recognised label; never classify an entire body line merely because it contains 'preferred'.
+    if any(x==h or x.startswith(h+":") for h in PREF_HEADINGS): return "preferred"
+    if any(x==h or x.startswith(h+":") for h in MUST_HEADINGS): return "required"
     return None
 
 def sectionize_jd(jd):
-    """Return blocks tagged required/preferred/general, preserving the heading as provenance."""
-    lines=[clean_line(x) for x in (jd or "").splitlines() if clean_line(x)]
+    """Return blocks tagged required/preferred/general, preserving heading provenance."""
+    jd=normalize_jd_sections(jd)
+    lines=[clean_line(x) for x in jd.splitlines() if clean_line(x)]
     blocks=[]; current_kind="general"; current_heading="General JD text"; bucket=[]
     for line in lines:
+        # Detect heading at start, including inline heading + content on same line.
+        m=re.match(r"^\s*(must\s*have|requirements?|required|essential|minimum\s+qualifications|qualifications|what\s+you\s+need|skills\s+required|nice\s*to\s*have|preferred|desirable|bonus|plus|advantage)\s*:\s*(.*)$", line, re.I)
+        if m:
+            if bucket: blocks.append((current_kind,current_heading,"\n".join(bucket)))
+            label=clean_line(m.group(1)); current_kind=heading_kind(label) or "general"; current_heading=label; bucket=[]
+            if clean_line(m.group(2)): bucket.append(clean_line(m.group(2)))
+            continue
         k=heading_kind(line)
         if k:
             if bucket: blocks.append((current_kind,current_heading,"\n".join(bucket)))
-            # Support inline headings such as "Must Have: Meta Ads, Google Ads".
-            parts=re.split(r"[:\-]",line,maxsplit=1)
-            current_kind=k; current_heading=parts[0].strip() if parts else line.rstrip(":")
-            bucket=[]
-            if len(parts)==2 and clean_line(parts[1]): bucket.append(clean_line(parts[1]))
+            current_kind=k; current_heading=line.strip().rstrip(":"); bucket=[]
         else:
             bucket.append(line)
     if bucket: blocks.append((current_kind,current_heading,"\n".join(bucket)))
@@ -247,9 +263,13 @@ def score_candidate(name,text,reqs):
         elif r["category"]=="preferred": preferred.append(row)
         else: preferred.append(row) # General mentions never count as mandatory.
         audit.append(row)
-    mandatory_score=(sum(x["Evidence Level"] for x in mandatory)/len(mandatory)*100) if mandatory else 100.0
+    # A missing mandatory set is a parser warning, not a license to award 100%.
+    if mandatory:
+        mandatory_score=sum(x["Evidence Level"] for x in mandatory)/len(mandatory)*100
+    else:
+        mandatory_score=0.0
     preferred_bonus=(sum(x["Evidence Level"] for x in preferred)/len(preferred)*10) if preferred else 0.0
-    final=mandatory_score + preferred_bonus
+    final=mandatory_score + preferred_bonus if mandatory else min(preferred_bonus, 25.0)
     # Missing mandatory requirements trigger a transparent cap.
     missing=[x for x in mandatory if x["Evidence Level"]==0]
     if missing: final=min(final, max(0, 94-6*(len(missing)-1)))

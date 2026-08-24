@@ -1,6 +1,6 @@
-# Opportunity Hub CV Screener v2.7
+# Opportunity Hub CV Screener v2.7.1
 
-## v2.7 focus: Evidence Validation & Requirement Classification
+## v2.7.1 focus: Evidence Validation & Requirement Classification
 
 This release fixes the two scoring problems exposed by v2.6:
 
@@ -27,3 +27,7 @@ streamlit run app.py
 ## Recommended deployment
 
 Deploy `app.py` on Streamlit Community Cloud from GitHub.
+
+
+## v2.7.1 hotfix
+Fixes flattened JD parsing, prevents all-candidate 100% scores when no must-have requirements are detected, and strengthens section-boundary recognition.

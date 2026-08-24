@@ -1,15 +1,17 @@
-# Opportunity Hub CV Screener v2.7.2
+# Opportunity Hub CV Screener v2.7.3
 
-## v2.7.2 — Requirement Lock & Scoring Calibration
+## v2.7.3 — Reliability Hotfix
 
-This release fixes the final scoring-core issues found in the controlled 10-CV regression test.
+This release fixes the v2.7.2 runtime crash caused by inconsistent requirement records reaching the scoring engine.
 
-### What is fixed
-- **Requirement lock:** only requirements explicitly extracted from the supplied JD's Must Have / Required or Nice to Have / Preferred sections can affect scoring.
-- **No hidden requirement injection:** a recogniser dictionary cannot introduce TikTok Ads, SEO, A/B testing, or any other requirement unless that wording is actually present in the relevant JD section.
-- **Requirement provenance:** every scored requirement shows its exact JD section and source excerpt.
-- **Fair evidence states:** `Explicitly absent`, `Not demonstrated in CV`, and `Weak / limited evidence` are distinct.
-- **Scoring calibration:** must-haves drive the main score; preferred items provide only a limited bonus.
+### Fixed
+- One canonical requirement schema is now used across JD parsing, scoring, audit and exports.
+- Pre-screen schema validation runs before any CV is scored.
+- Malformed requirements stop screening safely with a readable message instead of crashing the Streamlit app.
+- `requirement_rows()` now correctly returns and preserves both scoring requirements and parsed JD section metadata.
+- The undefined `jd_sections` state bug is removed.
+- Scoring uses validated requirement types only: `skill`, `preference`, `experience`, or `location`.
+- Existing v2.7.2 controls remain: requirement lock, JD provenance, no hidden skill injection, explicit negative evidence, and distinct `Explicitly absent` / `Not demonstrated` / `Weak evidence` states.
 
-### Controlled test expectation
-Use the same JD and 10 CVs. First inspect **JD Requirement Lock**. If a requirement is not shown there, it cannot affect any candidate score.
+### Regression test
+Use the same Digital Marketing Executive JD and 10 CVs. Before trusting scores, inspect **JD Requirement Lock**. If the detected requirements are wrong, stop there; do not rely on the ranking.

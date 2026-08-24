@@ -12,7 +12,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Opportunity Hub CV Screener v2.7.2", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Opportunity Hub CV Screener v2.7.3", page_icon="🎯", layout="wide")
 
 # ------------------------------ FILE INTAKE ------------------------------
 def sha256(data): return hashlib.sha256(data).hexdigest()
@@ -242,44 +242,131 @@ def candidate_name(filename,text):
             return line.title()
     return Path(filename).stem.replace("_"," ").replace("-"," ").strip()
 
+# ------------------------ REQUIREMENT SCHEMA GUARD -----------------------
+# v2.7.3 uses one canonical requirement schema throughout parsing, scoring,
+# audit and export. A malformed requirement stops screening with a controlled
+# message instead of crashing midway through a client job.
+CANONICAL_FIELDS={
+    "name": str,
+    "category": str,
+    "source": str,
+    "source_text": str,
+    "type": str,
+}
+VALID_CATEGORIES={"required","preferred"}
+VALID_TYPES={"skill","preference","experience","location"}
+
+def canonicalize_requirement(r):
+    if not isinstance(r, dict):
+        raise ValueError("A parsed requirement is not a structured record.")
+    out={
+        "name": clean_line(str(r.get("name", ""))),
+        "category": clean_line(str(r.get("category", ""))).lower(),
+        "source": clean_line(str(r.get("source", ""))),
+        "source_text": clean_line(str(r.get("source_text", ""))),
+        "type": clean_line(str(r.get("type", ""))).lower(),
+    }
+    if "patterns" in r: out["patterns"]=r["patterns"]
+    if "years" in r: out["years"]=r["years"]
+    if "location" in r: out["location"]=clean_line(str(r["location"])).lower()
+    return out
+
+def validate_requirements(reqs):
+    if not isinstance(reqs, list) or not reqs:
+        return False, "No scoring requirements were extracted from the Job Description.", []
+    clean=[]; errors=[]
+    for i, raw in enumerate(reqs, start=1):
+        try:
+            r=canonicalize_requirement(raw)
+            missing=[k for k in CANONICAL_FIELDS if not r.get(k)]
+            if missing:
+                errors.append(f"Requirement {i}: missing {', '.join(missing)}")
+                continue
+            if r["category"] not in VALID_CATEGORIES:
+                errors.append(f"Requirement {i} ({r['name']}): invalid category '{r['category']}'")
+                continue
+            if r["type"] not in VALID_TYPES:
+                errors.append(f"Requirement {i} ({r['name']}): invalid type '{r['type']}'")
+                continue
+            if r["type"] in {"skill","preference"} and not r.get("patterns"):
+                errors.append(f"Requirement {i} ({r['name']}): missing evidence patterns")
+                continue
+            if r["type"]=="experience" and not isinstance(r.get("years"), int):
+                errors.append(f"Requirement {i} ({r['name']}): missing valid years target")
+                continue
+            if r["type"]=="location" and not r.get("location"):
+                errors.append(f"Requirement {i} ({r['name']}): missing location target")
+                continue
+            clean.append(r)
+        except Exception as e:
+            errors.append(f"Requirement {i}: {str(e)}")
+    if errors:
+        return False, "Requirement schema validation failed: " + " | ".join(errors[:6]), clean
+    return True, "OK", clean
+
 # ------------------------------ SCORING ---------------------------------
 def classify_category(cat):
     return "Must-have" if cat=="required" else "Preferred" if cat=="preferred" else "General JD mention"
 
 def score_candidate(name,text,reqs):
+    # Final defensive guard: callers cannot score malformed requirements.
+    ok, message, reqs = validate_requirements(reqs)
+    if not ok:
+        raise ValueError(message)
+
     audit=[]; mandatory=[]; preferred=[]
     for r in reqs:
-        status=""; evidence=""; evtype=""
-        if r["type"] in ["skill","preference"]:
+        status=""; evidence=""; evtype=""; level=0.0
+        rtype=r["type"]
+        if rtype in ["skill","preference"]:
             level,status,evidence,evtype=evidence_for(text,r["patterns"])
-        elif r["type"]=="experience":
-            y=years(text); target=r["years"]; level=min(1.0,y/target) if target else 0
-            status="Meets requirement" if y>=target else "Below requirement"
+        elif rtype=="experience":
+            y=years(text); target=r["years"]
+            level=min(1.0,y/target) if target else 0.0
+            status="Meets requirement" if y>=target else ("Partial experience evidence" if y>0 else "Not demonstrated in CV")
             evidence=f"Estimated dated experience: {y} year(s)"
             evtype="Positive evidence" if y else "No evidence"
-        else:
+        elif rtype=="location":
             low=text.lower(); city=r["location"]
-            if city in low: level=1.0; status="Location matches"; evidence=city.title(); evtype="Positive evidence"
-            elif "remote" in low: level=0.5; status="Remote / review"; evidence="Remote location stated"; evtype="Partial evidence"
-            else: level=0.0; status="Not demonstrated in CV"; evidence=""; evtype="No evidence"
-        row={"Requirement":r["name"],"Category":classify_category(r["category"]),"Source / Provenance":r["source"],"Evidence Type":evtype,"Evidence Level":round(level,2),"Status":status,"Evidence":evidence}
+            if city in low:
+                level=1.0; status="Location matches"; evidence=city.title(); evtype="Positive evidence"
+            elif "remote" in low:
+                level=0.5; status="Remote / review"; evidence="Remote location stated"; evtype="Partial evidence"
+            else:
+                level=0.0; status="Not demonstrated in CV"; evidence=""; evtype="No evidence"
+
+        row={
+            "Requirement":r["name"],
+            "Category":classify_category(r["category"]),
+            "Source / Provenance":r["source"],
+            "JD Source Excerpt":r["source_text"],
+            "Requirement Type":rtype,
+            "Evidence Type":evtype,
+            "Evidence Level":round(float(level),2),
+            "Status":status,
+            "Evidence":evidence,
+        }
         if r["category"]=="required": mandatory.append(row)
-        elif r["category"]=="preferred": preferred.append(row)
-        else: preferred.append(row) # General mentions never count as mandatory.
+        else: preferred.append(row)
         audit.append(row)
-    # A missing mandatory set is a parser warning, not a license to award 100%.
-    if mandatory:
-        mandatory_score=sum(x["Evidence Level"] for x in mandatory)/len(mandatory)*100
-    else:
-        mandatory_score=0.0
+
+    # A missing mandatory set is never allowed to silently become a 100% score.
+    mandatory_score=(sum(x["Evidence Level"] for x in mandatory)/len(mandatory)*100) if mandatory else 0.0
     preferred_bonus=(sum(x["Evidence Level"] for x in preferred)/len(preferred)*10) if preferred else 0.0
-    final=mandatory_score + preferred_bonus if mandatory else min(preferred_bonus, 25.0)
-    # Missing mandatory requirements trigger a transparent cap.
+    final=(mandatory_score + preferred_bonus) if mandatory else min(preferred_bonus,25.0)
+
     missing=[x for x in mandatory if x["Evidence Level"]==0]
-    if missing: final=min(final, max(0, 94-6*(len(missing)-1)))
-    final=round(min(100,final))
+    if missing:
+        final=min(final, max(0,94-6*(len(missing)-1)))
+    final=round(min(100,max(0,final)))
+
     for row in audit:
-        row["Points Earned"] = round(row["Evidence Level"]*(100/len(mandatory)),2) if row in mandatory and mandatory else round(row["Evidence Level"]*(10/len(preferred)),2) if row in preferred and preferred else 0
+        if row in mandatory and mandatory:
+            row["Points Earned"]=round(row["Evidence Level"]*(100/len(mandatory)),2)
+        elif row in preferred and preferred:
+            row["Points Earned"]=round(row["Evidence Level"]*(10/len(preferred)),2)
+        else:
+            row["Points Earned"]=0.0
     group="Excellent" if final>=90 else "Good" if final>=70 else "Moderate" if final>=50 else "Do Not Hire"
     return final,group,audit,mandatory_score,preferred_bonus
 
@@ -340,8 +427,8 @@ def workbook(df,audits,dups,reqs):
     return bio.getvalue()
 
 # -------------------------------- UI -----------------------------------
-st.title("🎯 Opportunity Hub CV Screener v2.7")
-st.caption("Evidence Validation & Requirement Classification — prevents false-positive skill matches and records JD provenance.")
+st.title("🎯 Opportunity Hub CV Screener v2.7.3")
+st.caption("v2.7.3 Reliability Hotfix — canonical requirement schema, pre-screen validation and evidence-based scoring.")
 with st.expander("Client and recruitment details",expanded=True):
     a,b=st.columns(2)
     client=a.text_input("Client name")
@@ -361,8 +448,12 @@ if st.button("Screen CVs",type="primary"):
     for f in jd_files or []:
         tx,_,er=extract(f.name,f.getvalue()); final += "\n"+tx if tx else ""; errors += [f"JD {f.name}: {er}"] if er else []
     if len(final.strip())<30: st.error("A readable Job Description is required. The PDF may be scanned/image-only."); st.stop()
-    reqs=requirement_rows(final)
-    if not reqs: st.error("No usable requirements could be extracted from the Job Description. Use clear Must Have / Required / Nice to Have wording."); st.stop()
+    reqs, jd_sections = requirement_rows(final)
+    ok, validation_message, reqs = validate_requirements(reqs)
+    if not ok:
+        st.error(validation_message)
+        st.info("Screening was stopped before candidate scoring. Check the JD headings and requirement extraction instead of trusting a partial result.")
+        st.stop()
     records=[]
     for f in cv_files or []:
         for name,data in unpack(f.name,f.getvalue()):
@@ -378,7 +469,12 @@ if st.button("Screen CVs",type="primary"):
         else: valid.append(r)
     rows=[]; audits={}
     for r in valid:
-        name=candidate_name(r["filename"],r["text"]); s,g,audit,mandatory_score,preferred_bonus=score_candidate(name,r["text"],reqs)
+        name=candidate_name(r["filename"],r["text"])
+        try:
+            s,g,audit,mandatory_score,preferred_bonus=score_candidate(name,r["text"],reqs)
+        except Exception as e:
+            st.error(f"Screening stopped safely before results were published: {str(e)}")
+            st.stop()
         missing=[x["Requirement"] for x in audit if x["Category"]=="Must-have" and x["Evidence Level"]==0]
         rows.append({"Name":name,"Fit %":s,"Ranking Group":g,"Mandatory Score":round(mandatory_score,1),"Preferred Bonus":round(preferred_bonus,1),"Years Exp":years(r["text"]),"File":r["filename"],"Why Not 100%":"; ".join(missing[:4]) if missing else "No material must-have gaps detected"}); audits[name]=audit
     df=pd.DataFrame(rows).sort_values(["Fit %","Years Exp"],ascending=[False,False]).reset_index(drop=True) if rows else pd.DataFrame(columns=["Name","Fit %","Ranking Group","Mandatory Score","Preferred Bonus","Years Exp","File","Why Not 100%"])
@@ -387,9 +483,13 @@ res=st.session_state.results_v27
 if res:
     df=res["df"]; audits=res["audits"]; st.success(f"Screening complete: {len(df)} unique readable CVs screened.")
     if res["errors"]: st.warning("Some files need attention:\n\n"+"\n\n".join(res["errors"]))
-    st.subheader("Job Description Requirements Detected")
-    req_display=pd.DataFrame([{k:v for k,v in r.items() if k not in ["patterns","source_text"]} for r in res["reqs"]])
+    st.subheader("JD Requirement Lock")
+    st.caption("Only the requirements below are allowed to affect candidate scores. Each item passed schema validation before screening.")
+    req_display=pd.DataFrame([{k:v for k,v in r.items() if k not in ["patterns"]} for r in res["reqs"]])
     st.dataframe(req_display,use_container_width=True)
+    if res.get("jd_sections"):
+        with st.expander("Parsed JD sections used for requirement extraction"):
+            st.dataframe(pd.DataFrame(res["jd_sections"]),use_container_width=True)
     if res["duplicates"]: st.info(f"{len(res['duplicates'])} duplicate entries excluded from scoring."); st.dataframe(pd.DataFrame(res["duplicates"]),use_container_width=True)
     st.subheader("Master Ranking"); st.dataframe(df,use_container_width=True)
     st.subheader("Candidate-by-Candidate Scoring Audit")

@@ -12,7 +12,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Opportunity Hub CV Screener v2.7.3", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Opportunity Hub CV Screener v2.7.4", page_icon="🎯", layout="wide")
 
 # ------------------------------ FILE INTAKE ------------------------------
 def sha256(data): return hashlib.sha256(data).hexdigest()
@@ -85,13 +85,22 @@ ALL_LABELS=sorted(set(MUST_LABELS+PREF_LABELS), key=len, reverse=True)
 
 def clean_line(s): return re.sub(r"\s+"," ",(s or "")).strip()
 
+# v2.7.4 TRUE JD LOCK
+# The recogniser may recognise wording, but it is NEVER allowed to create a
+# requirement unless that wording (or an explicitly recognised synonym) exists
+# in the supplied JD source excerpt.
+QUALIFIER_PREFERRED=("preferably","preferred","nice to have","nice-to-have","advantage","desirable","bonus","plus")
+QUALIFIER_REQUIRED=("must have","must-have","required","essential")
+
+
 def normalize_jd_sections(jd):
     text=(jd or "").replace("\r","\n")
     text=re.sub(r"[*_#`]+", "", text)
-    # Force a boundary before recognised headings, including flattened 'Must Have: - X - Y Nice to Have: - Z'.
     labels="|".join(re.escape(x) for x in ALL_LABELS)
-    text=re.sub(r"(?i)(?<!\n)(?=\b(?:"+labels+r")\s*:)","\n",text)
+    # Force boundaries around labelled sections even after flattened extraction.
+    text=re.sub(r"(?i)(?<!\n)(?=\b(?:"+labels+r")\s*[:\-])", "\n", text)
     return text
+
 
 def section_kind_from_label(label):
     x=clean_line(label).lower().rstrip(":-")
@@ -99,80 +108,119 @@ def section_kind_from_label(label):
     if x in MUST_LABELS: return "required"
     return None
 
+
 def sectionize_jd(jd):
     text=normalize_jd_sections(jd)
-    lines=[]
-    for raw in text.splitlines():
-        raw=clean_line(raw)
-        if not raw: continue
-        # Split obvious inline bullet separators while preserving normal prose.
-        parts=re.split(r"\s+(?=[•\-*]\s+)", raw)
-        lines.extend([clean_line(x) for x in parts if clean_line(x)])
     blocks=[]; kind=None; heading=None; bucket=[]
-    label_pat=r"(?i)^\s*("+"|".join(re.escape(x) for x in ALL_LABELS)+r")\s*:\s*(.*)$"
-    for line in lines:
+    label_pat=r"(?i)^\s*("+"|".join(re.escape(x) for x in ALL_LABELS)+r")\s*[:\-]\s*(.*)$"
+    for raw in text.splitlines():
+        line=clean_line(raw)
+        if not line: continue
         m=re.match(label_pat,line)
         if m:
-            if heading is not None: blocks.append((kind,heading,"\n".join(bucket)))
+            if heading is not None:
+                blocks.append((kind,heading,"\n".join(bucket)))
             heading=clean_line(m.group(1)); kind=section_kind_from_label(heading); bucket=[]
             tail=clean_line(m.group(2))
             if tail: bucket.append(tail)
         elif heading is not None:
             bucket.append(line)
-    if heading is not None: blocks.append((kind,heading,"\n".join(bucket)))
+    if heading is not None:
+        blocks.append((kind,heading,"\n".join(bucket)))
     return blocks
 
-def excerpt_for_pattern(body, patterns):
-    # Exact requirement wording/excerpt for audit provenance.
-    units=re.split(r"\n|(?<=[.;])\s+", body)
-    for unit in units:
+
+def split_requirement_units(body):
+    units=[]
+    for raw in (body or "").splitlines():
+        line=clean_line(raw)
+        if not line: continue
+        # Preserve bullets, but split a flattened line at common bullet separators.
+        parts=re.split(r"\s*(?:•|\u2022|\-|\*)\s+", line)
+        units.extend(clean_line(x) for x in parts if clean_line(x))
+    return units or ([clean_line(body)] if clean_line(body) else [])
+
+
+def qualifier_category(unit, section_category, match_span=None):
+    low=(unit or "").lower()
+    # Qualifiers apply to the requirement they qualify, not automatically to every
+    # requirement on a combined line. Use a local context around the matched phrase.
+    if match_span is not None:
+        # Prefer qualifiers immediately before the requirement ("preferably fintech")
+        # or immediately after it ("fintech experience preferred"). This prevents a
+        # qualifier for one item on a combined line from reclassifying another item.
+        before=low[max(0, match_span[0]-35):match_span[0]]
+        after=low[match_span[1]:min(len(low), match_span[1]+20)]
+        low=before+" "+after
+    if any(q in low for q in QUALIFIER_PREFERRED):
+        return "preferred"
+    if any(q in low for q in QUALIFIER_REQUIRED):
+        return "required"
+    return section_category
+
+
+def first_matching_unit(body, patterns, strict_name=None):
+    for unit in split_requirement_units(body):
+        if strict_name and strict_name.lower() not in unit.lower():
+            continue
         for pat in patterns:
-            if re.search(pat,unit,re.I): return clean_line(unit)
-    return ""
+            m=re.search(pat, unit, re.I)
+            if m:
+                return unit, m.span()
+    return "", None
+
 
 def requirement_rows(jd):
     blocks=sectionize_jd(jd)
-    # LOCK: only explicit Must-have / Preferred sections can create scoring requirements.
     if not blocks:
         return [], []
-    rows=[]; seen={}
-    priority={"required":2,"preferred":1}
-    for kind,heading,body in blocks:
-        if kind not in priority: continue
+
+    rows=[]; seen={}; priority={"required":2,"preferred":1}
+    for section_category, heading, body in blocks:
+        if section_category not in priority:
+            continue
+
         for name,pats in SKILLS.items():
-            ex=excerpt_for_pattern(body,pats)
-            if ex:
-                cand={"name":name,"patterns":pats,"category":kind,"source":heading,
-                      "source_text":ex,"type":"skill"}
-                old=seen.get(name)
-                if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
-        for m in re.finditer(r"\b(\d+)\s*\+?\s*years?(?:\s+of)?(?:\s+relevant)?(?:\s+(?:digital|marketing|work|experience))?",body,re.I):
-            yrs=int(m.group(1)); name=f"{yrs}+ years relevant experience"
-            cand={"name":name,"years":yrs,"category":kind,"source":heading,
-                  "source_text":clean_line(m.group(0)),"type":"experience"}
+            # TikTok Ads is deliberately exact: no synonym or inferred injection.
+            strict_name="TikTok Ads" if name=="TikTok Ads" else None
+            ex, match_span=first_matching_unit(body,pats,strict_name=strict_name)
+            if not ex:
+                continue
+            category=qualifier_category(ex, section_category, match_span)
+            cand={"name":name,"patterns":pats,"category":category,"source":heading,
+                  "source_text":ex,"type":"skill"}
             old=seen.get(name)
-            if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
-        low=body.lower()
-        for city in ["lagos","abuja","port harcourt","ibadan","enugu"]:
-            if re.search(r"\b"+re.escape(city)+r"\b",low):
-                name=f"{city.title()} location / role suitability"
-                cand={"name":name,"location":city,"category":kind,"source":heading,
-                      "source_text":excerpt_for_pattern(body,[r"\b"+re.escape(city)+r"\b"]),"type":"location"}
+            if old is None or priority[category]>priority[old["category"]]:
+                seen[name]=cand
+
+        for unit in split_requirement_units(body):
+            for m in re.finditer(r"\b(\d+)\s*\+?\s*years?(?:\s+of)?(?:\s+relevant)?(?:\s+(?:digital|marketing|work|experience))?",unit,re.I):
+                category=qualifier_category(unit, section_category, m.span())
+                yrs=int(m.group(1)); name=f"{yrs}+ years relevant experience"
+                cand={"name":name,"years":yrs,"category":category,"source":heading,
+                      "source_text":unit,"type":"experience"}
                 old=seen.get(name)
-                if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
-                break
-        if any(x in low for x in ["fintech","banking","financial services"]):
-            name="Fintech / banking experience"
-            pats=[r"\bfintech\b",r"\bbank(?:ing)?\b",r"\bfinancial services\b",r"\bkuda\b",r"\bopay\b",r"\bcarbon\b",r"\bflutterwave\b",r"\bgtbank\b",r"\bmoniepoint\b"]
-            cand={"name":name,"patterns":pats,"category":kind,"source":heading,
-                  "source_text":excerpt_for_pattern(body,[r"\bfintech\b",r"\bbanking\b",r"\bfinancial services\b"]),"type":"preference"}
-            old=seen.get(name)
-            if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
+                if old is None or priority[category]>priority[old["category"]]:
+                    seen[name]=cand
+
+            low=unit.lower()
+            # Fintech/banking is a requirement only where actually mentioned in the JD.
+            if any(re.search(p, unit, re.I) for p in [r"\bfintech\b",r"\bbanking\b",r"\bfinancial services\b"]):
+                fintech_match=re.search(r"\bfintech\b|\bbanking\b|\bfinancial services\b", unit, re.I)
+                category=qualifier_category(unit, section_category, fintech_match.span() if fintech_match else None)
+                cand={"name":"Fintech / banking experience",
+                      "patterns":[r"\bfintech\b",r"\bbank(?:ing)?\b",r"\bfinancial services\b",r"\bkuda\b",r"\bopay\b",r"\bcarbon\b",r"\bflutterwave\b",r"\bgtbank\b",r"\bmoniepoint\b"],
+                      "category":category,"source":heading,"source_text":unit,"type":"preference"}
+                old=seen.get(cand["name"])
+                if old is None or priority[category]>priority[old["category"]]:
+                    seen[cand["name"]]=cand
+
     reqs=list(seen.values())
-    # Strict lock report: show exactly what was ignored rather than silently inventing criteria.
     info=[]
     for kind,heading,body in blocks:
-        info.append({"Section":heading,"Category":"Must-have" if kind=="required" else "Preferred","Extracted requirement count":sum(1 for r in reqs if r["source"]==heading),"Source excerpt":clean_line(body)[:500]})
+        info.append({"Section":heading,"Category":"Must-have" if kind=="required" else "Preferred",
+                     "Extracted requirement count":sum(1 for r in reqs if r["source"]==heading),
+                     "Source excerpt":clean_line(body)[:500]})
     return reqs, info
 
 # ------------------------- EVIDENCE VALIDATION --------------------------
@@ -291,6 +339,15 @@ def validate_requirements(reqs):
             if r["type"] in {"skill","preference"} and not r.get("patterns"):
                 errors.append(f"Requirement {i} ({r['name']}): missing evidence patterns")
                 continue
+            # TRUE JD LOCK: the audit excerpt itself must prove the requirement came from the JD.
+            if r["type"] in {"skill","preference"}:
+                if r["name"] == "TikTok Ads":
+                    source_ok = "tiktok ads" in r["source_text"].lower()
+                else:
+                    source_ok = any(re.search(pat, r["source_text"], re.I) for pat in r.get("patterns", []))
+                if not source_ok:
+                    errors.append(f"Requirement {i} ({r['name']}): invented or unverifiable requirement; source excerpt does not contain the requirement or a recognised synonym")
+                    continue
             if r["type"]=="experience" and not isinstance(r.get("years"), int):
                 errors.append(f"Requirement {i} ({r['name']}): missing valid years target")
                 continue
@@ -427,8 +484,8 @@ def workbook(df,audits,dups,reqs):
     return bio.getvalue()
 
 # -------------------------------- UI -----------------------------------
-st.title("🎯 Opportunity Hub CV Screener v2.7.3")
-st.caption("v2.7.3 Reliability Hotfix — canonical requirement schema, pre-screen validation and evidence-based scoring.")
+st.title("🎯 Opportunity Hub CV Screener v2.7.4")
+st.caption("v2.7.4 True JD Lock Hotfix — canonical requirement schema, pre-screen validation and evidence-based scoring.")
 with st.expander("Client and recruitment details",expanded=True):
     a,b=st.columns(2)
     client=a.text_input("Client name")

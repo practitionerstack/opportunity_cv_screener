@@ -1,33 +1,15 @@
-# Opportunity Hub CV Screener v2.7.1
+# Opportunity Hub CV Screener v2.7.2
 
-## v2.7.1 focus: Evidence Validation & Requirement Classification
+## v2.7.2 — Requirement Lock & Scoring Calibration
 
-This release fixes the two scoring problems exposed by v2.6:
+This release fixes the final scoring-core issues found in the controlled 10-CV regression test.
 
-1. **False-positive evidence:** `No GA4` or `No Google Ads` must not earn points merely because the skill name appears.
-2. **Incorrect requirement classification:** requirements are sourced from the JD and tagged as **Must-have**, **Preferred**, or **General JD mention**.
+### What is fixed
+- **Requirement lock:** only requirements explicitly extracted from the supplied JD's Must Have / Required or Nice to Have / Preferred sections can affect scoring.
+- **No hidden requirement injection:** a recogniser dictionary cannot introduce TikTok Ads, SEO, A/B testing, or any other requirement unless that wording is actually present in the relevant JD section.
+- **Requirement provenance:** every scored requirement shows its exact JD section and source excerpt.
+- **Fair evidence states:** `Explicitly absent`, `Not demonstrated in CV`, and `Weak / limited evidence` are distinct.
+- **Scoring calibration:** must-haves drive the main score; preferred items provide only a limited bonus.
 
-### Core rules
-
-- Must-have sections such as **Must Have**, **Required**, **Essential**, and **Minimum Qualifications** drive the primary score.
-- Preferred sections such as **Nice to Have**, **Preferred**, **Bonus**, and **Advantage** add only a limited bonus.
-- General JD mentions are never silently promoted to mandatory requirements.
-- Every audit row records **Source / Provenance** so the client can see where the requirement came from.
-- Explicit negative statements are recorded as **Explicitly absent / Negative evidence**.
-- Strong positive evidence elsewhere in the CV can still count if a candidate has both a negative self-summary and genuine demonstrated experience.
-- Duplicate files and duplicate extracted content are excluded from scoring.
-
-## Run locally
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Recommended deployment
-
-Deploy `app.py` on Streamlit Community Cloud from GitHub.
-
-
-## v2.7.1 hotfix
-Fixes flattened JD parsing, prevents all-candidate 100% scores when no must-have requirements are detected, and strengthens section-boundary recognition.
+### Controlled test expectation
+Use the same JD and 10 CVs. First inspect **JD Requirement Lock**. If a requirement is not shown there, it cannot affect any candidate score.

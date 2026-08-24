@@ -12,7 +12,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Opportunity Hub CV Screener v2.7.1", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Opportunity Hub CV Screener v2.7.2", page_icon="🎯", layout="wide")
 
 # ------------------------------ FILE INTAKE ------------------------------
 def sha256(data): return hashlib.sha256(data).hexdigest()
@@ -63,113 +63,117 @@ def unpack(name,data):
     return out
 
 # --------------------------- REQUIREMENT MODEL ---------------------------
+# v2.7.2 RULE: The JD is the sole source of scoring requirements.
+# This dictionary is only a recogniser for wording that actually appears in the JD.
 SKILLS={
 "Meta Ads":[r"\bmeta ads?\b",r"\bfacebook ads?\b",r"\binstagram ads?\b"],
 "Google Ads":[r"\bgoogle ads?\b",r"\badwords\b"],
 "Email Marketing":[r"\bemail campaigns?\b",r"\bemail marketing\b",r"\bnewsletter[s]?\b"],
-"Copywriting":[r"\bcopywriting\b",r"\bwrite copy\b",r"\bad copy\b",r"\bsocial copy\b"],
+"Copywriting":[r"\bcopywriting\b",r"\bwrite copy\b",r"\bad copy\b",r"\bsocial copy\b",r"\bcopy in (?:a|the) .*tone\b"],
 "GA4 / Google Analytics":[r"\bga4\b",r"\bgoogle analytics\b"],
 "Canva":[r"\bcanva\b"],
 "HubSpot":[r"\bhubspot\b"],
-"Basic Design":[r"\bbasic design\b",r"\bgraphic design\b",r"\bdesign creatives?\b"],
+"Basic Design":[r"\bbasic design\b",r"\bgraphic design\b",r"\bdesign skills?\b"],
 "TikTok Ads":[r"\btiktok ads?\b"],
 "SEO":[r"\bseo\b",r"\bsearch engine optimization\b"],
 "A/B Testing":[r"\ba/?b testing\b",r"\bsplit testing\b"],
 }
 
-MUST_HEADINGS=("must have","requirements","required","essential","minimum qualifications","qualifications","what you need","skills required")
-PREF_HEADINGS=("nice to have","preferred","desirable","bonus","plus","advantage")
-
+MUST_LABELS=("must have","must-have","requirements","required","essential","minimum qualifications","qualifications","what you need","skills required")
+PREF_LABELS=("nice to have","nice-to-have","preferred","desirable","bonus","plus","advantage")
+ALL_LABELS=sorted(set(MUST_LABELS+PREF_LABELS), key=len, reverse=True)
 
 def clean_line(s): return re.sub(r"\s+"," ",(s or "")).strip()
 
 def normalize_jd_sections(jd):
-    """Normalize flattened PDF/DOCX text so inline markdown headings become real section boundaries."""
-    text=(jd or "").replace("\r", "\n")
-    # Remove common markdown emphasis around headings without destroying body text.
-    text=re.sub(r"\*{1,3}\s*(Must\s*Have|Requirements?|Required|Essential|Minimum\s+Qualifications|Qualifications|What\s+You\s+Need|Skills\s+Required|Nice\s*to\s*Have|Preferred|Desirable|Bonus|Plus|Advantage)\s*\*{1,3}\s*:?", lambda m: "\n"+m.group(1).strip()+":", text, flags=re.I)
-    # Insert a boundary before recognised headings even when the extractor flattened everything onto one line.
-    heads=["Must Have","Requirements","Required","Essential","Minimum Qualifications","Qualifications","What You Need","Skills Required","Nice to Have","Preferred","Desirable","Bonus","Plus","Advantage"]
-    pat=r"(?i)(?<!\n)(?<!^)(?=\b(?:"+"|".join(re.escape(h) for h in heads)+r")\b\s*:)"
-    text=re.sub(pat,"\n",text)
+    text=(jd or "").replace("\r","\n")
+    text=re.sub(r"[*_#`]+", "", text)
+    # Force a boundary before recognised headings, including flattened 'Must Have: - X - Y Nice to Have: - Z'.
+    labels="|".join(re.escape(x) for x in ALL_LABELS)
+    text=re.sub(r"(?i)(?<!\n)(?=\b(?:"+labels+r")\s*:)","\n",text)
     return text
 
-def heading_kind(line):
-    x=clean_line(line).lower().strip(" *#_-\t").rstrip(":-")
-    # Heading must begin with a recognised label; never classify an entire body line merely because it contains 'preferred'.
-    if any(x==h or x.startswith(h+":") for h in PREF_HEADINGS): return "preferred"
-    if any(x==h or x.startswith(h+":") for h in MUST_HEADINGS): return "required"
+def section_kind_from_label(label):
+    x=clean_line(label).lower().rstrip(":-")
+    if x in PREF_LABELS: return "preferred"
+    if x in MUST_LABELS: return "required"
     return None
 
 def sectionize_jd(jd):
-    """Return blocks tagged required/preferred/general, preserving heading provenance."""
-    jd=normalize_jd_sections(jd)
-    lines=[clean_line(x) for x in jd.splitlines() if clean_line(x)]
-    blocks=[]; current_kind="general"; current_heading="General JD text"; bucket=[]
+    text=normalize_jd_sections(jd)
+    lines=[]
+    for raw in text.splitlines():
+        raw=clean_line(raw)
+        if not raw: continue
+        # Split obvious inline bullet separators while preserving normal prose.
+        parts=re.split(r"\s+(?=[•\-*]\s+)", raw)
+        lines.extend([clean_line(x) for x in parts if clean_line(x)])
+    blocks=[]; kind=None; heading=None; bucket=[]
+    label_pat=r"(?i)^\s*("+"|".join(re.escape(x) for x in ALL_LABELS)+r")\s*:\s*(.*)$"
     for line in lines:
-        # Detect heading at start, including inline heading + content on same line.
-        m=re.match(r"^\s*(must\s*have|requirements?|required|essential|minimum\s+qualifications|qualifications|what\s+you\s+need|skills\s+required|nice\s*to\s*have|preferred|desirable|bonus|plus|advantage)\s*:\s*(.*)$", line, re.I)
+        m=re.match(label_pat,line)
         if m:
-            if bucket: blocks.append((current_kind,current_heading,"\n".join(bucket)))
-            label=clean_line(m.group(1)); current_kind=heading_kind(label) or "general"; current_heading=label; bucket=[]
-            if clean_line(m.group(2)): bucket.append(clean_line(m.group(2)))
-            continue
-        k=heading_kind(line)
-        if k:
-            if bucket: blocks.append((current_kind,current_heading,"\n".join(bucket)))
-            current_kind=k; current_heading=line.strip().rstrip(":"); bucket=[]
-        else:
+            if heading is not None: blocks.append((kind,heading,"\n".join(bucket)))
+            heading=clean_line(m.group(1)); kind=section_kind_from_label(heading); bucket=[]
+            tail=clean_line(m.group(2))
+            if tail: bucket.append(tail)
+        elif heading is not None:
             bucket.append(line)
-    if bucket: blocks.append((current_kind,current_heading,"\n".join(bucket)))
-    if not blocks and jd.strip(): blocks=[("general","General JD text",jd)]
+    if heading is not None: blocks.append((kind,heading,"\n".join(bucket)))
     return blocks
 
-def find_in(text, patterns):
-    return any(re.search(p,text,re.I) for p in patterns)
+def excerpt_for_pattern(body, patterns):
+    # Exact requirement wording/excerpt for audit provenance.
+    units=re.split(r"\n|(?<=[.;])\s+", body)
+    for unit in units:
+        for pat in patterns:
+            if re.search(pat,unit,re.I): return clean_line(unit)
+    return ""
 
 def requirement_rows(jd):
     blocks=sectionize_jd(jd)
+    # LOCK: only explicit Must-have / Preferred sections can create scoring requirements.
+    if not blocks:
+        return [], []
     rows=[]; seen={}
-    # Prefer explicit sections. General JD text is used only when there are no explicit sections for a skill.
-    for kind, heading, body in blocks:
-        for name,pats in SKILLS.items():
-            if find_in(body,pats):
-                candidate={"name":name,"patterns":pats,"category":kind,"source":heading,"source_text":body,"type":"skill"}
-                priority={"required":3,"preferred":2,"general":1}
-                old=seen.get(name)
-                if old is None or priority[kind]>priority[old["category"]]: seen[name]=candidate
-    rows=list(seen.values())
-    # Years: search within the block that actually contains it; required beats preferred.
-    year_seen=None
-    for kind, heading, body in blocks:
-        m=re.search(r"\b(\d+)\s*\+?\s*years?(?:\s+of)?(?:\s+relevant)?",body,re.I)
-        if m:
-            cand={"name":f"{m.group(1)}+ years relevant experience","years":int(m.group(1)),"category":kind,"source":heading,"source_text":body,"type":"experience"}
-            if year_seen is None or {"general":1,"preferred":2,"required":3}[kind]>{"general":1,"preferred":2,"required":3}[year_seen["category"]]: year_seen=cand
-    if year_seen: rows.append(year_seen)
-    # Location is a suitability preference unless the JD explicitly says on-site / hybrid in a city.
+    priority={"required":2,"preferred":1}
     for kind,heading,body in blocks:
+        if kind not in priority: continue
+        for name,pats in SKILLS.items():
+            ex=excerpt_for_pattern(body,pats)
+            if ex:
+                cand={"name":name,"patterns":pats,"category":kind,"source":heading,
+                      "source_text":ex,"type":"skill"}
+                old=seen.get(name)
+                if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
+        for m in re.finditer(r"\b(\d+)\s*\+?\s*years?(?:\s+of)?(?:\s+relevant)?(?:\s+(?:digital|marketing|work|experience))?",body,re.I):
+            yrs=int(m.group(1)); name=f"{yrs}+ years relevant experience"
+            cand={"name":name,"years":yrs,"category":kind,"source":heading,
+                  "source_text":clean_line(m.group(0)),"type":"experience"}
+            old=seen.get(name)
+            if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
         low=body.lower()
         for city in ["lagos","abuja","port harcourt","ibadan","enugu"]:
-            if city in low:
-                cat="required" if kind=="required" and ("hybrid" in low or "on-site" in low or "onsite" in low) else "preferred"
-                rows.append({"name":f"{city.title()} location / role suitability","location":city,"category":cat,"source":heading,"source_text":body,"type":"location"})
+            if re.search(r"\b"+re.escape(city)+r"\b",low):
+                name=f"{city.title()} location / role suitability"
+                cand={"name":name,"location":city,"category":kind,"source":heading,
+                      "source_text":excerpt_for_pattern(body,[r"\b"+re.escape(city)+r"\b"]),"type":"location"}
+                old=seen.get(name)
+                if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
                 break
-        if any(city in low for city in ["lagos","abuja","port harcourt","ibadan","enugu"]): break
-    # Domain experience only if actually stated in JD.
-    full=jd.lower()
-    if any(x in full for x in ["fintech","banking","financial services"]):
-        source="General JD text"; cat="preferred"
-        for kind,heading,body in blocks:
-            if any(x in body.lower() for x in ["fintech","banking","financial services"]):
-                source=heading; cat="required" if kind=="required" else "preferred"; break
-        rows.append({"name":"Fintech / banking experience","patterns":[r"\bfintech\b",r"\bbank(?:ing)?\b",r"\bfinancial services\b",r"\bkuda\b",r"\bopay\b",r"\bcarbon\b",r"\bflutterwave\b",r"\bgtbank\b",r"\bmoniepoint\b"],"category":cat,"source":source,"source_text":"fintech / banking","type":"preference"})
-    # Deduplicate by name, keeping strongest category.
-    out={}
-    pri={"required":3,"preferred":2,"general":1}
-    for r in rows:
-        if r["name"] not in out or pri[r["category"]]>pri[out[r["name"]]["category"]]: out[r["name"]]=r
-    return list(out.values())
+        if any(x in low for x in ["fintech","banking","financial services"]):
+            name="Fintech / banking experience"
+            pats=[r"\bfintech\b",r"\bbank(?:ing)?\b",r"\bfinancial services\b",r"\bkuda\b",r"\bopay\b",r"\bcarbon\b",r"\bflutterwave\b",r"\bgtbank\b",r"\bmoniepoint\b"]
+            cand={"name":name,"patterns":pats,"category":kind,"source":heading,
+                  "source_text":excerpt_for_pattern(body,[r"\bfintech\b",r"\bbanking\b",r"\bfinancial services\b"]),"type":"preference"}
+            old=seen.get(name)
+            if old is None or priority[kind]>priority[old["category"]]: seen[name]=cand
+    reqs=list(seen.values())
+    # Strict lock report: show exactly what was ignored rather than silently inventing criteria.
+    info=[]
+    for kind,heading,body in blocks:
+        info.append({"Section":heading,"Category":"Must-have" if kind=="required" else "Preferred","Extracted requirement count":sum(1 for r in reqs if r["source"]==heading),"Source excerpt":clean_line(body)[:500]})
+    return reqs, info
 
 # ------------------------- EVIDENCE VALIDATION --------------------------
 NEG_PATTERNS=[
@@ -221,7 +225,7 @@ def evidence_for(text, patterns):
         return positives[0][0],positives[0][1],positives[0][2],"Positive evidence"
     if negatives:
         return 0.0,"Explicitly absent",negatives[0],"Negative evidence"
-    return 0.0,"No evidence found","","No evidence"
+    return 0.0,"Not demonstrated in CV","","No evidence"
 
 def years(text):
     current=date.today().year; total=0
@@ -257,7 +261,7 @@ def score_candidate(name,text,reqs):
             low=text.lower(); city=r["location"]
             if city in low: level=1.0; status="Location matches"; evidence=city.title(); evtype="Positive evidence"
             elif "remote" in low: level=0.5; status="Remote / review"; evidence="Remote location stated"; evtype="Partial evidence"
-            else: level=0.0; status="No matching location evidence"; evidence=""; evtype="No evidence"
+            else: level=0.0; status="Not demonstrated in CV"; evidence=""; evtype="No evidence"
         row={"Requirement":r["name"],"Category":classify_category(r["category"]),"Source / Provenance":r["source"],"Evidence Type":evtype,"Evidence Level":round(level,2),"Status":status,"Evidence":evidence}
         if r["category"]=="required": mandatory.append(row)
         elif r["category"]=="preferred": preferred.append(row)
@@ -378,7 +382,7 @@ if st.button("Screen CVs",type="primary"):
         missing=[x["Requirement"] for x in audit if x["Category"]=="Must-have" and x["Evidence Level"]==0]
         rows.append({"Name":name,"Fit %":s,"Ranking Group":g,"Mandatory Score":round(mandatory_score,1),"Preferred Bonus":round(preferred_bonus,1),"Years Exp":years(r["text"]),"File":r["filename"],"Why Not 100%":"; ".join(missing[:4]) if missing else "No material must-have gaps detected"}); audits[name]=audit
     df=pd.DataFrame(rows).sort_values(["Fit %","Years Exp"],ascending=[False,False]).reset_index(drop=True) if rows else pd.DataFrame(columns=["Name","Fit %","Ranking Group","Mandatory Score","Preferred Bonus","Years Exp","File","Why Not 100%"])
-    st.session_state.results_v27={"df":df,"audits":audits,"duplicates":dups,"errors":errors,"client":client,"address":address,"officer":officer,"email":email,"project":project,"reqs":reqs}
+    st.session_state.results_v27={"df":df,"audits":audits,"duplicates":dups,"errors":errors,"client":client,"address":address,"officer":officer,"email":email,"project":project,"reqs":reqs,"jd_sections":jd_sections}
 res=st.session_state.results_v27
 if res:
     df=res["df"]; audits=res["audits"]; st.success(f"Screening complete: {len(df)} unique readable CVs screened.")

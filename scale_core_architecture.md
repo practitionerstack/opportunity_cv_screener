@@ -1,15 +1,17 @@
-# Scale path
+# Scale-Core Architecture Note
 
-v2.6 is for immediate use. Millions of CVs should not be processed inside one Streamlit process.
+v2.7 remains a Streamlit MVP. It is designed to validate intake and scoring correctness before high-volume processing.
 
-Upgrade path:
-1. Object storage for files.
-2. Upload manifest instead of one HTTP request containing all CVs.
-3. Queue-based ingestion.
-4. Stateless extraction workers.
-5. OCR worker pool for scanned PDFs.
-6. PostgreSQL metadata and audit tables.
-7. Hash-based duplicate detection plus similarity fingerprints.
-8. Batch IDs, retries, checkpoints and dead-letter queues.
-9. Separate scoring workers and report-generation workers.
-10. Human-review queue for ambiguous evidence.
+For thousands to millions of CVs, the next architecture should separate:
+
+- intake/object storage
+- queue-based batch processing
+- document extraction workers
+- OCR workers for scanned PDFs
+- scoring service
+- audit database
+- duplicate index
+- report generation workers
+- client dashboard
+
+The scoring rules validated in v2.7 should become the auditable scoring core before scaling infrastructure is added.

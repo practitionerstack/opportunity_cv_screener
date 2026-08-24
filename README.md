@@ -1,20 +1,29 @@
-# Opportunity Hub CV Screener v2.6
+# Opportunity Hub CV Screener v2.7
 
-## Reliability & Auditability Fix
+## v2.7 focus: Evidence Validation & Requirement Classification
 
-This release focuses on:
-1. Robust PDF intake using PyMuPDF first and pypdf as fallback.
-2. Evidence-based scoring rather than loose keyword accumulation.
-3. Candidate-by-candidate requirement, evidence, status and points audit trail.
-4. Duplicate file/content detection.
-5. Persistent Streamlit results after downloads.
+This release fixes the two scoring problems exposed by v2.6:
 
-## Supported intake
-- JD: PDF, DOCX, TXT, CSV, XLSX/XLS or pasted text.
-- CVs: PDF, DOCX, TXT, CSV, XLSX/XLS, individual uploads or ZIP batches.
+1. **False-positive evidence:** `No GA4` or `No Google Ads` must not earn points merely because the skill name appears.
+2. **Incorrect requirement classification:** requirements are sourced from the JD and tagged as **Must-have**, **Preferred**, or **General JD mention**.
 
-## PDF behavior
-Text-based PDFs are extracted through two parser paths. If both fail, or the PDF is scanned/image-only, the application reports that clearly instead of silently treating the file as a valid CV. OCR is a later scale-layer addition.
+### Core rules
 
-## Scoring philosophy
-The screener extracts explicit JD requirements, separates required from preferred requirements, scores direct evidence more highly than weak evidence, checks experience, records evidence used, and prevents a perfect score when required requirements have no evidence.
+- Must-have sections such as **Must Have**, **Required**, **Essential**, and **Minimum Qualifications** drive the primary score.
+- Preferred sections such as **Nice to Have**, **Preferred**, **Bonus**, and **Advantage** add only a limited bonus.
+- General JD mentions are never silently promoted to mandatory requirements.
+- Every audit row records **Source / Provenance** so the client can see where the requirement came from.
+- Explicit negative statements are recorded as **Explicitly absent / Negative evidence**.
+- Strong positive evidence elsewhere in the CV can still count if a candidate has both a negative self-summary and genuine demonstrated experience.
+- Duplicate files and duplicate extracted content are excluded from scoring.
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Recommended deployment
+
+Deploy `app.py` on Streamlit Community Cloud from GitHub.

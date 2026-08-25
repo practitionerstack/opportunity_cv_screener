@@ -1,9 +1,6 @@
 streamlit
 pandas
 openpyxl
-pymupdf
+PyMuPDF
 pypdf
 python-docx
-reportlab
-matplotlib
-xlrd
